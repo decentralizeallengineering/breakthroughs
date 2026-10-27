@@ -1,0 +1,362 @@
+#!/usr/bin/env python3
+"""breakthroughs: cheap wide brainstorm, then one careful reliability review.
+
+Phase HOT runs 3 to 10 cheap model workers in parallel, each with a different lens.
+Phase COOL runs one stronger model that scores every merged idea for reliability.
+Only the Python standard library is used. Models are reached through the `claude` CLI.
+"""
+import argparse
+import concurrent.futures
+import datetime
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+
+MIN_WORKERS = 3
+MAX_WORKERS = 10
+JACCARD_THRESHOLD = 0.6
+TOOLS = "Read,Grep,Glob"
+VERDICTS = ("TRY NOW", "SPIKE", "PARK")
+IDEA_KEYS = ("idea", "why_it_could_work", "first_step", "evidence_in_repo")
+JUDGE_KEYS = ("id", "works", "evidence_checked", "reliability_risk",
+              "cost_hours", "reversibility", "verdict")
+
+
+def prompts_dir():
+    env = os.environ.get("BREAKTHROUGHS_PROMPTS")
+    if env:
+        return env
+    here = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(os.path.dirname(here), "prompts")
+
+
+def read_prompt(name):
+    with open(os.path.join(prompts_dir(), name), encoding="utf-8") as fh:
+        return fh.read()
+
+
+def clamp_workers(n):
+    return max(MIN_WORKERS, min(MAX_WORKERS, int(n)))
+
+
+def load_lenses():
+    """Return [(name, instruction)] from the lines of prompts/lenses.md that start with '- '."""
+    lenses = []
+    for line in read_prompt("lenses.md").splitlines():
+        if line.startswith("- ") and ":" in line:
+            name, text = line[2:].split(":", 1)
+            lenses.append((name.strip(), text.strip()))
+    if len(lenses) < MAX_WORKERS:
+        raise SystemExit("lenses.md must list at least %d lenses" % MAX_WORKERS)
+    return lenses
+
+
+def claude_cmd(model):
+    # The prompt is sent on stdin so that no argument can swallow it.
+    return ["claude", "-p", "--model", model, "--tools", TOOLS,
+            "--allowedTools", TOOLS, "--output-format", "text"]
+
+
+def fill(template, **values):
+    for key, val in values.items():
+        template = template.replace("{" + key + "}", val)
+    return template
+
+
+def hot_prompt(goal, lens):
+    return fill(read_prompt("hot.md"), lens_name=lens[0], lens=lens[1], goal=goal)
+
+
+def default_runner(cmd, prompt, cwd, timeout):
+    """Run one headless model call. Returns (returncode, stdout, stderr)."""
+    try:
+        res = subprocess.run(cmd, input=prompt, capture_output=True, text=True,
+                             cwd=cwd, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return 124, "", "timeout after %ss" % timeout
+    except OSError as exc:
+        return 127, "", str(exc)
+    return res.returncode, res.stdout, res.stderr
+
+
+def parse_json_lines(text, required, kind):
+    """Parse JSON Lines strictly. Returns (records, failures).
+
+    Code-fence lines and blank lines are skipped. Any other line that is not a JSON
+    object with all required keys becomes a recorded failure. Nothing is repaired.
+    """
+    records, failures = [], []
+    for num, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("```"):
+            continue
+        try:
+            obj = json.loads(line)
+        except ValueError as exc:
+            failures.append({"line_no": num, "error": "bad json: %s" % exc, "raw": line[:300]})
+            continue
+        if not isinstance(obj, dict):
+            failures.append({"line_no": num, "error": "not a json object", "raw": line[:300]})
+            continue
+        missing = [k for k in required if k not in obj]
+        if missing:
+            failures.append({"line_no": num, "error": "missing keys: " + ",".join(missing),
+                             "raw": line[:300]})
+            continue
+        records.append(obj)
+    return records, failures
+
+
+def tokens(text):
+    return set(re.findall(r"[a-z0-9]+", str(text).lower()))
+
+
+def jaccard(a, b):
+    if not a and not b:
+        return 1.0
+    return len(a & b) / len(a | b)
+
+
+def merge_ideas(found, threshold=JACCARD_THRESHOLD):
+    """found: list of (lens_name, idea_dict). Merge near-identical ideas by token Jaccard.
+
+    The first wording is kept. agreement is the number of distinct lenses that found it.
+    """
+    merged = []
+    for lens_name, obj in found:
+        tok = tokens(obj["idea"])
+        for m in merged:
+            if jaccard(tok, m["_tok"]) >= threshold:
+                if lens_name not in m["lenses"]:
+                    m["lenses"].append(lens_name)
+                break
+        else:
+            merged.append({"idea": str(obj["idea"]),
+                           "why_it_could_work": str(obj["why_it_could_work"]),
+                           "first_step": str(obj["first_step"]),
+                           "evidence_in_repo": str(obj["evidence_in_repo"]),
+                           "lenses": [lens_name], "_tok": tok})
+    for i, m in enumerate(merged, 1):
+        m["id"] = "i%d" % i
+        m["agreement"] = len(m["lenses"])
+        del m["_tok"]
+    return merged
+
+
+def valid_judgement(obj):
+    works, hours = obj.get("works"), obj.get("cost_hours")
+    ok_int = lambda v, lo, hi: isinstance(v, int) and not isinstance(v, bool) and lo <= v <= hi
+    if not ok_int(works, 0, 5):
+        return "works must be an integer 0..5"
+    if not ok_int(hours, 0, 10 ** 6):
+        return "cost_hours must be a non-negative integer"
+    if obj.get("verdict") not in VERDICTS:
+        return "verdict must be one of: " + ", ".join(VERDICTS)
+    return None
+
+
+def run_hot(repo, goal, workers, model, runner, timeout):
+    lenses = load_lenses()[:workers]
+    jobs = [(lens, hot_prompt(goal, lens)) for lens in lenses]
+    cmd = claude_cmd(model)
+
+    def one(job):
+        lens, prompt = job
+        return lens[0], runner(cmd, prompt, repo, timeout)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        results = list(pool.map(one, jobs))
+    found, failures = [], []
+    for lens_name, (rc, out, err) in results:
+        if rc != 0:
+            failures.append({"phase": "hot", "lens": lens_name,
+                             "error": "exit %s: %s" % (rc, (err or "").strip()[:300])})
+            continue
+        recs, fails = parse_json_lines(out, IDEA_KEYS, "idea")
+        for r in recs:
+            found.append((lens_name, r))
+        for f in fails:
+            failures.append(dict(f, phase="hot", lens=lens_name))
+        if not recs and not fails:
+            failures.append({"phase": "hot", "lens": lens_name, "error": "no output"})
+    return found, failures
+
+
+def run_cool(repo, goal, ideas, model, runner, timeout):
+    brief = "\n".join(json.dumps({k: i[k] for k in ("id", "idea", "why_it_could_work",
+                                                    "first_step", "evidence_in_repo",
+                                                    "agreement")}) for i in ideas)
+    prompt = fill(read_prompt("cool.md"), ideas=brief, goal=goal)
+    rc, out, err = runner(claude_cmd(model), prompt, repo, timeout)
+    if rc != 0:
+        return {}, [{"phase": "cool", "error": "exit %s: %s" % (rc, (err or "").strip()[:300])}]
+    recs, fails = parse_json_lines(out, JUDGE_KEYS, "judgement")
+    failures = [dict(f, phase="cool") for f in fails]
+    known = {i["id"] for i in ideas}
+    judged = {}
+    for r in recs:
+        problem = valid_judgement(r)
+        if r["id"] not in known:
+            problem = "unknown idea id: %s" % r["id"]
+        if problem:
+            failures.append({"phase": "cool", "error": problem, "raw": json.dumps(r)[:300]})
+        else:
+            judged[r["id"]] = {k: r[k] for k in JUDGE_KEYS if k != "id"}
+    return judged, failures
+
+
+def rank_key(rec):
+    j = rec.get("judgement")
+    if not j:
+        return (len(VERDICTS), 0, -rec["agreement"], 0)
+    return (VERDICTS.index(j["verdict"]), -j["works"], -rec["agreement"], j["cost_hours"])
+
+
+def write_jsonl(path, meta, ideas, judged, failures):
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(json.dumps(dict(meta, type="meta")) + "\n")
+        for i in ideas:
+            fh.write(json.dumps(dict(i, type="idea", judgement=judged.get(i["id"]))) + "\n")
+        for f in failures:
+            fh.write(json.dumps(dict(f, type="parse_failure")) + "\n")
+
+
+def read_jsonl(path):
+    meta, ideas, failures = {}, [], []
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            if not line.strip():
+                continue
+            obj = json.loads(line)
+            kind = obj.get("type")
+            if kind == "meta":
+                meta = obj
+            elif kind == "idea":
+                ideas.append(obj)
+            elif kind == "parse_failure":
+                failures.append(obj)
+    return meta, ideas, failures
+
+
+def render_report(meta, ideas, failures):
+    ranked = sorted(ideas, key=rank_key)
+    lines = ["# Breakthroughs report %s" % meta.get("date", ""), "",
+             "Goal: %s" % meta.get("goal", ""), "",
+             "Hot model: %s, judge model: %s, workers: %s. Ideas after merge: %d. Parse failures: %d."
+             % (meta.get("hot_model", "?"), meta.get("judge_model", "?"),
+                meta.get("workers", "?"), len(ideas), len(failures)), ""]
+    for verdict in VERDICTS + ("UNJUDGED",):
+        group = [r for r in ranked if (r.get("judgement") or {}).get("verdict", "UNJUDGED") == verdict]
+        if not group:
+            continue
+        lines += ["## %s" % verdict, ""]
+        for r in group:
+            j = r.get("judgement")
+            lines.append("### %s: %s" % (r["id"], r["idea"]))
+            lines.append("")
+            lines.append("- Found by %d lens(es): %s" % (r["agreement"], ", ".join(r["lenses"])))
+            lines.append("- Why it could work: %s" % r["why_it_could_work"])
+            lines.append("- First step: %s" % r["first_step"])
+            lines.append("- Evidence claimed by worker: %s" % r["evidence_in_repo"])
+            if j:
+                lines.append("- Works (0-5): %d" % j["works"])
+                lines.append("- Evidence checked by judge: %s" % j["evidence_checked"])
+                lines.append("- Reliability risk: %s" % j["reliability_risk"])
+                lines.append("- Cost to try (hours): %d" % j["cost_hours"])
+                lines.append("- Reversibility: %s" % j["reversibility"])
+            else:
+                lines.append("- Not judged: the judge returned no valid score for this idea.")
+            lines.append("")
+    if failures:
+        lines += ["## Parse failures", "",
+                  "These outputs could not be parsed and were not repaired or guessed.", ""]
+        for f in failures:
+            where = f.get("phase", "?") + (" / " + f["lens"] if f.get("lens") else "")
+            raw = f.get("raw")
+            lines.append("- %s: %s%s" % (where, f.get("error", ""),
+                                         (" | `%s`" % raw.replace("`", "'")) if raw else ""))
+        lines.append("")
+    return "\n".join(lines)
+
+
+def cmd_run(args, runner, out):
+    workers = clamp_workers(args.workers)
+    repo = os.path.abspath(args.repo)
+    if workers != args.workers:
+        print("workers clamped from %d to %d" % (args.workers, workers), file=out)
+    if args.dry_run:
+        lenses = load_lenses()[:workers]
+        for lens in lenses:
+            prompt = hot_prompt(args.goal, lens)
+            print("HOT lens=%s cwd=%s prompt=%d chars: %s" % (
+                lens[0], repo, len(prompt), " ".join(shlex.quote(c) for c in claude_cmd(args.hot_model))), file=out)
+        print("COOL cwd=%s: %s" % (repo, " ".join(shlex.quote(c) for c in claude_cmd(args.judge_model))), file=out)
+        print("dry run: no model was called", file=out)
+        return 0
+    if not os.path.isdir(repo):
+        print("not a directory: %s" % repo, file=sys.stderr)
+        return 2
+    found, failures = run_hot(repo, args.goal, workers, args.hot_model, runner, args.timeout)
+    ideas = merge_ideas(found)
+    judged = {}
+    if ideas:
+        judged, cool_fail = run_cool(repo, args.goal, ideas, args.judge_model, runner, args.timeout)
+        failures += cool_fail
+    date = datetime.date.today().isoformat()
+    meta = {"date": date, "goal": args.goal, "workers": workers,
+            "hot_model": args.hot_model, "judge_model": args.judge_model}
+    os.makedirs(args.out, exist_ok=True)
+    jl = os.path.join(args.out, "ideas.jsonl")
+    write_jsonl(jl, meta, ideas, judged, failures)
+    rep = os.path.join(args.out, "report-%s.md" % date)
+    _, recs, fails = read_jsonl(jl)
+    with open(rep, "w", encoding="utf-8") as fh:
+        fh.write(render_report(meta, recs, fails))
+    print("ideas: %d, parse failures: %d" % (len(ideas), len(failures)), file=out)
+    print(jl, file=out)
+    print(rep, file=out)
+    return 0
+
+
+def cmd_report(args, out):
+    meta, ideas, failures = read_jsonl(args.ideas)
+    date = meta.get("date") or datetime.date.today().isoformat()
+    rep = args.out or os.path.join(os.path.dirname(os.path.abspath(args.ideas)),
+                                   "report-%s.md" % date)
+    with open(rep, "w", encoding="utf-8") as fh:
+        fh.write(render_report(meta, ideas, failures))
+    print(rep, file=out)
+    return 0
+
+
+def build_parser():
+    p = argparse.ArgumentParser(prog="breakthroughs", description=__doc__.split("\n")[0])
+    sub = p.add_subparsers(dest="command", required=True)
+    r = sub.add_parser("run", help="run the hot and cool phases against a repository")
+    r.add_argument("repo")
+    r.add_argument("--goal", required=True, help="what would be a breakthrough")
+    r.add_argument("--workers", type=int, default=5, help="clamped to %d..%d" % (MIN_WORKERS, MAX_WORKERS))
+    r.add_argument("--hot-model", default="haiku")
+    r.add_argument("--judge-model", default="sonnet")
+    r.add_argument("--out", default="breakthroughs", help="output directory (default ./breakthroughs)")
+    r.add_argument("--timeout", type=int, default=900, help="seconds per model call")
+    r.add_argument("--dry-run", action="store_true", help="print the commands and call no model")
+    rp = sub.add_parser("report", help="re-render the report from an ideas.jsonl")
+    rp.add_argument("ideas")
+    rp.add_argument("--out", help="report file (default report-<date>.md beside ideas.jsonl)")
+    return p
+
+
+def main(argv=None, runner=None, out=None):
+    out = out or sys.stdout
+    args = build_parser().parse_args(argv)
+    if args.command == "report":
+        return cmd_report(args, out)
+    return cmd_run(args, runner or default_runner, out)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
